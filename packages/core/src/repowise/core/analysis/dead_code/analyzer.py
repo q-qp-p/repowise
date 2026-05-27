@@ -28,6 +28,7 @@ from .constants import (
     _is_fixture_path,
 )
 from .contract_methods import is_contract_method
+from .go_reachability import build_go_package_files, is_go_file_reachable
 
 # Symbol kinds that cannot be independently imported by name in any
 # supported language. Flagging them as "unused exports" is a guaranteed
@@ -84,11 +85,32 @@ def _non_importable_kinds(language: str) -> frozenset[str]:
 # New code should prefer ``_non_importable_kinds(language)``.
 _NON_IMPORTABLE_SYMBOL_KINDS: frozenset[str] = _UNIVERSAL_NON_IMPORTABLE | frozenset({"interface"})
 
+# Aggregate *type* kinds that are never call targets. The unused-internal
+# pass is a call-graph check ("private symbol with no incoming CALL edges"),
+# which is meaningful for functions/methods but not for types: a struct or
+# interface used only as a field/parameter/return type — especially within
+# its own file — has no call edge and no observable symbol-level type edge,
+# so "no callers" is not evidence of deadness. Such types are still subject
+# to the *unused-export* pass (which reasons over import names / type_use),
+# so genuinely-dead exported types are still surfaced there.
+_UNCALLABLE_TYPE_KINDS: frozenset[str] = frozenset({
+    "struct",
+    "interface",
+    "enum",
+    "type_alias",
+})
+
 # Symbol names that are language-runtime entry points or compiler-implicit
 # anchors — never invoked by user-authored callers, never dead.
 _ENTRY_POINT_SYMBOL_NAMES: frozenset[str] = frozenset({
     "Main",                # C#, Java, Kotlin, Go, Rust, Swift, Scala
     "main",                # most others
+    # ---- Go runtime / test conventions ------------------------------
+    # ``func init`` is run by the Go runtime when the package is linked —
+    # never called by name, so it has no inbound call edge. ``TestMain``
+    # is the test-binary entry the ``go test`` runner invokes by reflection.
+    "init",
+    "TestMain",
     "MauiProgram",         # .NET MAUI
     "Program",             # C# top-level / classic console
     "Startup",             # ASP.NET Core legacy
@@ -200,6 +222,15 @@ class DeadCodeAnalyzer:
         self._dynamic_import_files = find_dynamic_import_files(
             parsed_files or {}
         ) | find_dynamic_edge_files(graph)
+        # Lazily-built ``.go`` package-directory → file-node map, used by the
+        # Go package-granular reachability hook (see ``go_reachability``).
+        self._go_package_files: dict[str, list[str]] | None = None
+
+    def _go_packages(self) -> dict[str, list[str]]:
+        """Return the cached Go package map, building it on first use."""
+        if self._go_package_files is None:
+            self._go_package_files = build_go_package_files(self.graph)
+        return self._go_package_files
 
     def analyze(
         self,
@@ -342,8 +373,14 @@ class DeadCodeAnalyzer:
             if self._is_api_contract(node_data):
                 continue
 
-            in_deg = self.graph.in_degree(node)
-            if in_deg > 0:
+            # Go reachability is package-granular: a file with no direct
+            # importer can still be live (entry-package sibling next to
+            # main.go, or a package whose siblings carry the import). Delegate
+            # to the Go helper instead of the raw file-level in_degree check.
+            if str(node).endswith(".go"):
+                if is_go_file_reachable(str(node), self.graph, self._go_packages()):
+                    continue
+            elif self.graph.in_degree(node) > 0:
                 continue
 
             finding = self._make_unreachable_finding(str(node), node_data, dynamic_patterns)
@@ -457,9 +494,21 @@ class DeadCodeAnalyzer:
             # via ``cargo.<attr>`` and we cannot tell statically which
             # attribute is being called. Treat all public symbols as live.
             # Generic across Python and TS/JS — no repo-specific assumptions.
+            #
+            # Excluded for Go: every Go import names the *package*, and a
+            # file commonly shares its package's name (``dynacache.go`` in
+            # package ``dynacache``), which would blanket-rescue every public
+            # symbol in such files. Go package-qualified calls are now
+            # resolved precisely (call_resolver._resolve_go_package_call), so
+            # the imprecise namespace rescue is both unnecessary and harmful
+            # here — it would hide genuinely dead exports.
             file_stem = Path(str(node)).stem
             file_imported_as_namespace = False
-            if file_stem and file_stem not in ("__init__", "index"):
+            if (
+                file_stem
+                and file_stem not in ("__init__", "index")
+                and node_data.get("language") != "go"
+            ):
                 for pred in self.graph.predecessors(node):
                     edge = self.graph.get_edge_data(pred, node, {})
                     if edge.get("edge_type") != "imports":
@@ -681,6 +730,11 @@ class DeadCodeAnalyzer:
             # Skip the entire language until call-edge support lands.
             if node_data.get("language") == "rust":
                 continue
+            # Go's call resolver now resolves same-package (sibling-file) and
+            # package-qualified calls (see call_resolver._resolve_go_*), so
+            # private symbols used across a package's files carry real
+            # ``calls`` edges and no longer read as universally uncalled. The
+            # blanket exemption that Phase 2 added has been lifted.
             if node_data.get("visibility") not in ("private", "internal"):
                 continue
             file_path = node_data.get("file_path", "")
@@ -704,6 +758,11 @@ class DeadCodeAnalyzer:
             if "." in sym_name:
                 continue
             if node_data.get("kind") in _non_importable_kinds(node_data.get("language", "unknown")):
+                continue
+            # Non-callable type kinds can't have CALL edges; the call-graph
+            # check this pass performs is meaningless for them (see
+            # _UNCALLABLE_TYPE_KINDS). They remain covered by unused_export.
+            if node_data.get("kind") in _UNCALLABLE_TYPE_KINDS:
                 continue
             if is_contract_method(
                 sym_name, node_data.get("kind"), node_data.get("language", "unknown")
