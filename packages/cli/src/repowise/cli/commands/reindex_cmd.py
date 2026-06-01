@@ -45,9 +45,9 @@ async def _reindex(repo_path, embedder_name: str, batch_size: int) -> None:
     from pathlib import Path
 
     from sqlalchemy import select
-    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-    from repowise.core.persistence.database import init_db
+    from repowise.core.persistence.database import create_engine, init_db
     from repowise.core.persistence.models import Page
 
     # --- Resolve embedder ---
@@ -85,10 +85,7 @@ async def _reindex(repo_path, embedder_name: str, batch_size: int) -> None:
 
     # --- Open database ---
     db_url = get_db_url_for_repo(repo_path)
-    connect_args = {}
-    if db_url.startswith("sqlite"):
-        connect_args["check_same_thread"] = False
-    engine = create_async_engine(db_url, connect_args=connect_args)
+    engine = create_engine(db_url)
     await init_db(engine)
     factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
