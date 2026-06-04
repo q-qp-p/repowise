@@ -68,6 +68,16 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
         self._symbol_pagerank_cache: dict[str, float] | None = None
         self._symbol_betweenness_cache: dict[str, float] | None = None
         self._execution_flow_cache: Any | None = None
+        # Filtered-subgraph caches — rebuilt lazily; guarded by a lock because
+        # the init pipeline computes metrics concurrently (asyncio.to_thread).
+        import threading
+
+        self._subgraph_lock = threading.Lock()
+        self._file_subgraph_cache: nx.DiGraph | None = None
+        self._symbol_subgraph_cache: nx.DiGraph | None = None
+        # Shared import-name maps (built once per build(), injected into the
+        # call + heritage resolvers; reset whenever files change).
+        self._import_name_maps: Any | None = None
 
     def set_tsconfig_resolver(self, resolver: Any) -> None:
         """Attach a :class:`TsconfigResolver` for TS/JS path-alias resolution."""
@@ -86,6 +96,20 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
         self._symbol_pagerank_cache = None
         self._symbol_betweenness_cache = None
         self._execution_flow_cache = None
+        self._file_subgraph_cache = None
+        self._symbol_subgraph_cache = None
+        self._import_name_maps = None
+
+    def _invalidate_subgraph_caches(self) -> None:
+        """Clear only the filtered-subgraph caches.
+
+        Called by graph mutations that historically did NOT clear the metric
+        caches (co-change edge refresh, framework edges) — those keep their
+        existing semantics, but a cached subgraph must never go stale
+        structurally.
+        """
+        self._file_subgraph_cache = None
+        self._symbol_subgraph_cache = None
 
     def release_graph(self) -> None:
         """Drop the in-memory NetworkX object after metrics are materialized.
@@ -102,6 +126,7 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
         """
         self._graph = nx.DiGraph()
         self._built = True
+        self._invalidate_subgraph_caches()  # they hold the old structure — free it
 
     # ------------------------------------------------------------------
     # Building
